@@ -21,9 +21,17 @@ DETAIL_WORK_FORMAT = "[data-qa='work-formats-text'], [data-qa='work-schedule-by-
 
 # === Apply Flow ===
 APPLY_BUTTON = "[data-qa='vacancy-response-link-top'], [data-qa='vacancy-response-button']"
-APPLY_FORM = "[data-qa='vacancy-response-popup-form']"
+APPLY_FORM = (
+    "[data-qa='vacancy-response-popup-form'], "
+    "form[name='vacancy_response'], "
+    "form#RESPONSE_MODAL_FORM_ID, "
+    "[role='dialog'] form"
+)
 RESUME_SELECT = "[data-qa='vacancy-response-popup-form-resume-dropdown']"
-COVER_LETTER_TOGGLE = "[data-qa='vacancy-response-letter-toggle']"
+COVER_LETTER_TOGGLE = (
+    "[data-qa='add-cover-letter'], "
+    "[data-qa='vacancy-response-letter-toggle']"
+)
 COVER_LETTER_INPUT = "[data-qa='vacancy-response-popup-form-letter-input']"
 SUBMIT_BUTTON = "[data-qa='vacancy-response-submit-popup']"
 ALREADY_APPLIED = "[data-qa='vacancy-response-link-view-topic']"

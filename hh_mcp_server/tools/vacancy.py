@@ -3,7 +3,7 @@ from typing import Any
 from fastmcp import FastMCP
 
 from hh_mcp_server.constants import TOOL_TIMEOUT_SECONDS
-from hh_mcp_server.drivers.browser import get_page
+from hh_mcp_server.drivers.browser import get_page, new_page
 from hh_mcp_server.scraping.vacancy_search import search_vacancies as _search
 from hh_mcp_server.scraping.vacancy_search import get_recommended_vacancies as _recommended
 from hh_mcp_server.scraping.vacancy_detail import parse_vacancy_page
@@ -75,6 +75,12 @@ def register_vacancy_tools(mcp: FastMCP) -> None:
         Args:
             vacancy_id: hh.ru vacancy ID (e.g., "12345678")
         """
-        page = await get_page()
-        await ensure_authenticated(page)
-        return await parse_vacancy_page(page, vacancy_id)
+        # Details requests may arrive concurrently. Do not navigate the shared
+        # first tab: concurrent page.goto calls cancel each other with
+        # net::ERR_ABORTED. The context still shares the saved hh.ru session.
+        page = await new_page()
+        try:
+            await ensure_authenticated(page)
+            return await parse_vacancy_page(page, vacancy_id)
+        finally:
+            await page.close()

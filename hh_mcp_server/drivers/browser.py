@@ -59,6 +59,12 @@ async def get_page() -> Page:
     return await ctx.new_page()
 
 
+async def new_page() -> Page:
+    """Create an isolated tab while reusing the shared authenticated context."""
+    ctx = await get_or_create_context()
+    return await ctx.new_page()
+
+
 async def save_state() -> None:
     if _context is not None:
         PROFILE_DIR.mkdir(parents=True, exist_ok=True)

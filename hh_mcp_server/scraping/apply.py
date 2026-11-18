@@ -1,4 +1,5 @@
 import logging
+import re
 
 from playwright.async_api import Page
 
@@ -61,25 +62,47 @@ async def detect_questions(page: Page) -> list[dict]:
 
 async def fill_questions(page: Page, questions: list[dict], answers: dict[str, str]) -> None:
     """Fill in question answers by matching label text or name to textarea."""
+    def normalize(value: str) -> str:
+        return re.sub(r"\s+", " ", value).strip().casefold()
+
+    normalized_answers = {
+        normalize(key): value for key, value in answers.items() if isinstance(value, str)
+    }
+    missing: list[str] = []
+
     for q in questions:
         label = q["label"]
         name = q["name"]
-        # Try matching by label first, then by name
-        answer = answers.get(label) or answers.get(name)
-        if not answer:
-            # Try fuzzy match - strip whitespace and compare
-            for key, val in answers.items():
-                if key.strip() == label.strip():
-                    answer = val
+        # Accept either the generated textarea name or the visible question.
+        answer = answers.get(name) or answers.get(label)
+        if answer is None:
+            answer = normalized_answers.get(normalize(name))
+        if answer is None:
+            answer = normalized_answers.get(normalize(label))
+        if answer is None:
+            # Some callers omit punctuation or use a shortened question.
+            label_key = normalize(label)
+            for key, value in normalized_answers.items():
+                if label_key and (label_key in key or key in label_key):
+                    answer = value
                     break
-        if not answer:
+        if answer is None or not isinstance(answer, str):
             logger.warning("No answer found for question: %s (name=%s)", label, name)
+            missing.append(name)
             continue
 
-        textarea = await page.query_selector(f'textarea[name="{name}"]')
-        if textarea:
-            await textarea.fill(answer)
-            logger.info("Filled question '%s' with answer", label[:50])
+        textarea = page.locator(f'textarea[name="{name}"]').first
+        if not await textarea.count():
+            missing.append(name)
+            continue
+        await textarea.fill(answer)
+        logger.info("Filled question '%s' with answer", label[:50])
+
+        if not (await textarea.input_value()).strip():
+            missing.append(name)
+
+    if missing:
+        raise ApplyError(f"Required questions were not answered: {', '.join(missing)}")
 
 
 async def dismiss_cookie_banner(page: Page) -> None:
@@ -94,18 +117,42 @@ async def dismiss_cookie_banner(page: Page) -> None:
 
 
 async def _fill_cover_letter(page: Page, cover_letter: str) -> None:
-    """Fill cover letter on the page (works for both popup and full-page forms)."""
-    toggle = await page.query_selector(S.COVER_LETTER_TOGGLE)
-    if toggle:
-        await toggle.click()
-        await page.wait_for_timeout(1000)
+    """Fill the current hh.ru cover-letter textarea and verify its value."""
+    if not cover_letter.strip():
+        raise ApplyError("Cover letter must not be empty.")
 
-    letter_input = await page.query_selector(S.COVER_LETTER_INPUT)
-    if letter_input:
-        await letter_input.fill(cover_letter)
-        logger.info("Cover letter filled")
-    else:
-        logger.warning("Cover letter input not found")
+    # Older response forms hid the textarea behind a toggle. The current
+    # Magritte modal renders it directly, but keeping the toggle fallback
+    # makes the flow work with both variants.
+    letter_input = page.locator(S.COVER_LETTER_INPUT).first
+    try:
+        await letter_input.wait_for(state="visible", timeout=5000)
+    except Exception:
+        # In the current Magritte modal the letter editor is not mounted until
+        # the user clicks "Добавить сопроводительное".
+        toggle = page.locator(S.COVER_LETTER_TOGGLE).first
+        if await toggle.count():
+            await toggle.click()
+        try:
+            await letter_input.wait_for(state="visible", timeout=10000)
+        except Exception as exc:
+            raise ApplyError(
+                "Cover letter field did not appear in the response form "
+                "(expected data-qa='vacancy-response-popup-form-letter-input')."
+            ) from exc
+
+    await letter_input.fill(cover_letter)
+    actual_value = await letter_input.input_value()
+    if actual_value != cover_letter:
+        # React-controlled textareas can occasionally overwrite a synthetic
+        # input event; retry via keyboard input and verify once more.
+        await letter_input.click()
+        await letter_input.press("Control+A")
+        await letter_input.type(cover_letter)
+        actual_value = await letter_input.input_value()
+    if actual_value != cover_letter:
+        raise ApplyError("Cover letter could not be filled into the response form.")
+    logger.info("Cover letter filled (%d characters)", len(cover_letter))
 
 
 async def apply_to_vacancy(
@@ -142,8 +189,15 @@ async def apply_to_vacancy(
     # Check if redirected to full-page response form
     is_response_page = "vacancy_response" in page.url
 
-    # Check if a popup form appeared
-    form = await page.query_selector(S.APPLY_FORM)
+    # New hh.ru modals render asynchronously and use form[name="vacancy_response"]
+    # without the legacy data-qa wrapper. Wait for the actual form instead of
+    # taking a single DOM snapshot after the click.
+    form = None
+    try:
+        await page.wait_for_selector(S.APPLY_FORM, state="attached", timeout=10000)
+        form = await page.query_selector(S.APPLY_FORM)
+    except Exception:
+        form = None
 
     if not form and not is_response_page:
         # Maybe it applied directly (one-click apply)
@@ -157,6 +211,11 @@ async def apply_to_vacancy(
 
         return {"status": "error", "message": "Apply form did not appear."}
 
+    # The modal can be present even when the legacy wrapper is absent. Use the
+    # actual form as the scope for all subsequent controls when possible.
+    if form:
+        logger.info("Response form detected: %s", await form.get_attribute("id"))
+
     # Detect questions
     questions = await detect_questions(page)
     if questions and not question_answers:
@@ -168,16 +227,29 @@ async def apply_to_vacancy(
 
     # Fill questions if provided
     if question_answers and questions:
-        await fill_questions(page, questions, question_answers)
+        try:
+            await fill_questions(page, questions, question_answers)
+        except ApplyError as exc:
+            return {"status": "error", "message": str(exc), "questions": questions}
 
     # Fill cover letter
     if cover_letter:
-        await _fill_cover_letter(page, cover_letter)
+        try:
+            await _fill_cover_letter(page, cover_letter)
+        except ApplyError as exc:
+            return {"status": "error", "message": str(exc)}
 
     # Submit
     submit_btn = await page.query_selector(S.SUBMIT_BUTTON)
     if not submit_btn:
         return {"status": "error", "message": "Submit button not found."}
+
+    # The current button submits RESPONSE_MODAL_FORM_ID. Check the field one
+    # last time so a submit can never silently discard the cover letter.
+    if cover_letter:
+        letter_input = page.locator(S.COVER_LETTER_INPUT).first
+        if not await letter_input.count() or (await letter_input.input_value()) != cover_letter:
+            return {"status": "error", "message": "Cover letter is not present in the form."}
 
     await submit_btn.click()
     await page.wait_for_timeout(3000)
@@ -188,8 +260,10 @@ async def apply_to_vacancy(
         error_text = await page.evaluate("""() => {
             const el = document.querySelector('[data-qa="vacancy-response-popup-error"]');
             if (el) return el.textContent.trim();
-            // Check if questions are still shown (not answered)
-            const q = document.querySelector('textarea[name^="task_"]');
+            // A question textarea remains in the DOM after filling. Only an
+            // empty value means validation failed because it was unanswered.
+            const q = [...document.querySelectorAll('textarea[name^="task_"]')]
+                .find((textarea) => !textarea.value.trim());
             if (q) return 'Required questions were not answered.';
             return '';
         }""")
